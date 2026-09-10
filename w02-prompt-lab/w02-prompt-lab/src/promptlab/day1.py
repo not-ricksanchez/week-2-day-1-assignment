@@ -5,18 +5,24 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from promptlab.config import PROJECT_ROOT, Settings
+from promptlab.usage import CallRecord, append_record, compute_cost
 
 DAY1_CASE_IDS = ("E12", "E07", "E11")
 CASES_PATH = PROJECT_ROOT / "cases" / "extraction.jsonl"
 PROMPT_PATH = PROJECT_ROOT / "src" / "prompts" / "baseline.v0.md"
+PROMPT_ID = "baseline"
+PROMPT_VERSION = "v0"
 TEMPERATURE = 0.0
 MAX_OUTPUT_TOKENS = 256
+TRUNCATION_NUM_PREDICT = 8
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,85 @@ def map_ollama_usage(payload: dict[str, Any], latency_ms: int) -> ModelCallResul
     )
 
 
+def build_record(
+    *,
+    run_id: str,
+    model_id: str,
+    case: ExtractionCase,
+    result: ModelCallResult,
+    temperature: float,
+    max_output_tokens: int,
+    attempt: int = 1,
+    error_type: str | None = None,
+) -> CallRecord:
+    return CallRecord(
+        record_id=str(uuid4()),
+        run_id=run_id,
+        timestamp=datetime.now(UTC),
+        provider="ollama",
+        model_id=model_id,
+        task="extraction",
+        case_id=case.case_id,
+        prompt_id=PROMPT_ID,
+        prompt_version=PROMPT_VERSION,
+        attempt=attempt,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        cached_input_tokens=None,
+        latency_ms=result.latency_ms,
+        cost_usd=compute_cost(model_id, result.input_tokens, result.output_tokens),
+        stop_reason=result.stop_reason,
+        error_type=error_type,
+        response_text=result.response_text,
+    )
+
+
+def demonstrate_truncation(
+    settings: Settings,
+    template: str,
+    case: ExtractionCase,
+    *,
+    model_id: str,
+    temperature: float,
+    num_predict: int,
+    demo_run_id: str,
+) -> CallRecord | None:
+    prompt = render_prompt(template, case.source)
+    result = call_mistral(
+        settings,
+        prompt,
+        temperature=temperature,
+        num_predict=num_predict,
+    )
+    print(
+        f"truncation demo {case.case_id}\t"
+        f"num_predict={num_predict}\t"
+        f"stop_reason={result.stop_reason}\t"
+        f"output_tokens={result.output_tokens}"
+    )
+    print(f"{result.response_text}\n")
+    if result.stop_reason != "length":
+        print(
+            "truncation demo did not hit the output ceiling; "
+            f"got done_reason={result.stop_reason!r}"
+        )
+        return None
+    record = build_record(
+        run_id=demo_run_id,
+        model_id=model_id,
+        case=case,
+        result=result,
+        temperature=temperature,
+        max_output_tokens=num_predict,
+        attempt=2,
+        error_type="TruncatedResponseError",
+    )
+    append_record(record, demo_run_id)
+    return record
+
+
 def call_mistral(
     settings: Settings,
     prompt: str,
@@ -116,24 +201,60 @@ def call_mistral(
 
 def main() -> None:
     settings = Settings.from_env()
+    model_id = settings.models["mistral"].model_id
+    run_id = str(uuid4())
     template = load_prompt(PROMPT_PATH)
     cases = load_extraction_cases(CASES_PATH, DAY1_CASE_IDS)
+    num_predict = MAX_OUTPUT_TOKENS
     for case in cases:
         prompt = render_prompt(template, case.source)
         result = call_mistral(
             settings,
             prompt,
             temperature=TEMPERATURE,
-            num_predict=MAX_OUTPUT_TOKENS,
+            num_predict=num_predict,
         )
+        record = build_record(
+            run_id=run_id,
+            model_id=model_id,
+            case=case,
+            result=result,
+            temperature=TEMPERATURE,
+            max_output_tokens=num_predict,
+        )
+        append_record(record, run_id)
         print(
             f"{case.case_id}\t"
+            f"record_id={record.record_id}\t"
             f"input_tokens={result.input_tokens}\t"
             f"output_tokens={result.output_tokens}\t"
             f"stop_reason={result.stop_reason}\t"
             f"latency_ms={result.latency_ms}"
         )
         print(f"{result.response_text}\n")
+    print(f"wrote {len(cases)} records to runs/{run_id}.jsonl")
+
+    e11 = next(case for case in cases if case.case_id == "E11")
+    num_predict = TRUNCATION_NUM_PREDICT
+    truncation_run_id = f"{run_id}-truncation"
+    truncation_record = demonstrate_truncation(
+        settings,
+        template,
+        e11,
+        model_id=model_id,
+        temperature=TEMPERATURE,
+        num_predict=num_predict,
+        demo_run_id=truncation_run_id,
+    )
+    num_predict = MAX_OUTPUT_TOKENS
+    if truncation_record is not None:
+        print(
+            "recorded TruncatedResponseError "
+            f"(record_id={truncation_record.record_id}) "
+            f"in runs/{truncation_run_id}.jsonl; "
+            "excluded from the three-record evidence file"
+        )
+    print(f"restored num_predict to {num_predict}")
 
 
 if __name__ == "__main__":
