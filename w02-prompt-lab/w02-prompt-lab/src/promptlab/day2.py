@@ -63,7 +63,6 @@ def build_request(
         prompt_id=PROMPT_ID,
         prompt_version=PROMPT_VERSION,
         system=system,
-        think = False,
         user_content=user_content,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
