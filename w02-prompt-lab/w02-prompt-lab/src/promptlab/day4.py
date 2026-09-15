@@ -17,6 +17,7 @@ from promptlab.schemas import (
     TriageOutputWithAnalysis,
     schema_description,
 )
+from promptlab.scoring import SCORE_PATH, score_records
 from promptlab.structured import StructuredCompletionError, complete_structured
 from promptlab.usage import append_record as append_call_record
 
@@ -174,20 +175,29 @@ def main() -> None:
 
     if RUN_PATH.exists():
         RUN_PATH.unlink()
+    if SCORE_PATH.exists():
+        SCORE_PATH.unlink()
 
+    outcomes: list[CaseOutcome] = []
     for version, schema in PROMPT_SPECS:
         template = load(PROMPT_ID, version)
-        run_prompt_version(
-            adapter=adapter,
-            cases=cases,
-            template=template,
-            schema=schema,
-            run_id=run_id,
-            model_name=model.logical_name,
-            temperature=TEMPERATURE,
-            max_repairs=max_repairs,
-            out_path=RUN_PATH,
+        outcomes.extend(
+            run_prompt_version(
+                adapter=adapter,
+                cases=cases,
+                template=template,
+                schema=schema,
+                run_id=run_id,
+                model_name=model.logical_name,
+                temperature=TEMPERATURE,
+                max_repairs=max_repairs,
+                out_path=RUN_PATH,
+            )
         )
+
+    scores = score_records([outcome.record for outcome in outcomes])
+    for score in scores:
+        append_record(SCORE_PATH, score)
 
     print()
     print(f"run_id={run_id}")
@@ -197,6 +207,7 @@ def main() -> None:
     print(f"cases={len(cases)}")
     print(f"prompt versions={[version for version, _schema in PROMPT_SPECS]}")
     print(f"wrote output records to {RUN_PATH}")
+    print(f"wrote {len(scores)} score records to {SCORE_PATH}")
     print(f"wrote call records to runs/{run_id}.jsonl")
 
 

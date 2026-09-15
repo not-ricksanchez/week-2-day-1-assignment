@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from promptlab.config import PROJECT_ROOT
-from promptlab.records import OutputRecord, ScoreRecord
+from promptlab.records import OutputRecord, ScoreRecord, append_record, load_records
 
 SCORER_VERSION = "day4.v1"
 GOLD_PATH = PROJECT_ROOT / "cases" / "gold" / "triage.jsonl"
+RUN_PATH = PROJECT_ROOT / "docs" / "day4-run.jsonl"
+SCORE_PATH = PROJECT_ROOT / "docs" / "day4-scores.jsonl"
 
 # config.py does not ship boundary-language patterns. These cover the
 # final-outcome language the Day 4 contract forbids in draft replies.
@@ -200,3 +202,23 @@ def score_records(
         gold = labels[record.case_id]
         scores.extend(score_output(record, gold))
     return scores
+
+
+def main() -> None:
+    outputs = load_records(RUN_PATH, OutputRecord)
+    if not outputs:
+        raise SystemExit(f"no output records at {RUN_PATH}")
+
+    if SCORE_PATH.exists():
+        SCORE_PATH.unlink()
+
+    scores = score_records(outputs)
+    for score in scores:
+        append_record(SCORE_PATH, score)
+
+    print(f"scored {len(outputs)} outputs")
+    print(f"wrote {len(scores)} score records to {SCORE_PATH}")
+
+
+if __name__ == "__main__":
+    main()
