@@ -16,7 +16,7 @@ Qwen did not hit a schema validation error on this run, so the repair step never
 
 ## Additional Note (I tested the prompts on mistral as well)
 
-### mistral:7b (same prompts, earlier run)
+### mistral:7b (same prompts)
 
 Also used mistral:7b on a different run with same params(temperature 0) . Same `summarize.v1.md` and `extract.v2.md` cases.
 
