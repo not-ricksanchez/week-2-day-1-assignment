@@ -52,6 +52,8 @@ The scored case corpora and the example pool are separate. Never copy a scored c
 
 ## Instructions
 
+
+
 ### 1. Use the existing `SummarizationOutput`
 
 Do not author a new summarization schema.
@@ -93,6 +95,8 @@ Requirements:
 - use only facts present in the supplied document
 - values not present in the source must be represented using the schema's absent form
 - use `citation`, not `section`, for evidence
+
+
 
 ### 4. Create `src/prompts/extract.v2.md`
 
@@ -153,6 +157,8 @@ Extraction output must validate against:
 PolicyExtraction
 ```
 
+
+
 ### 7. Run the leakage check
 
 Search extraction outputs for distinctive strings that appear only in the two example documents included in `extract.v2.md`.
@@ -188,6 +194,8 @@ Include:
 - example leakage count
 - citation-existence failure count
 - two sentences describing the most common validation error and what changed in response
+
+
 
 ### 10. Run engineering checks
 
@@ -231,3 +239,4 @@ The shipped `EvidenceField`, `SummarizationOutput`, and `PolicyExtraction` are e
 13. Citation-existence checking reads `EvidenceField.citation`.
 14. `docs/day3-notes.md` contains both repair rates, leakage count, and citation failure count.
 15. `pytest`, `ruff check`, and `mypy` pass.
+
