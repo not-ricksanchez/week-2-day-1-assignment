@@ -1,6 +1,7 @@
 # Day 4 notes
 
-Used qwen3:8b at temperature 0.0. One shared `run_id` (`a9cd640a-da5e-4062-b043-58d9f8b585bf`) covered `triage.v1` and `triage.v2` on the same 12 cases.
+Used qwen3:8b at temperature 0.0. and cost = $0.00  One shared `run_id` (`a9cd640a-da5e-4062-b043-58d9f8b585bf`) covered `triage.v1` and `triage.v2` on the same 12 cases.
+
 ## triage.v1
 
 queue correct: 12/12
