@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from pydantic import ValidationError
 
 from promptlab.config import PII_PATTERNS, PROJECT_ROOT
 from promptlab.records import OutputRecord, ScoreRecord, append_record, load_records
+from promptlab.rules import VersionCandidate, select_current_version
 from promptlab.schemas import PolicyExtraction, SummarizationOutput
 
 SCORER_VERSION = "day5.v1"
@@ -49,6 +52,9 @@ class GoldLabel:
     expected_escalation: bool | None = None
     expected_status: str | None = None
     recoverable_fields: tuple[str, ...] = ()
+    version_group: str | None = None
+    expected_current_case_id: str | None = None
+    as_of: str | None = None
 
 
 def load_gold_labels(path: Path | None = None) -> dict[str, GoldLabel]:
@@ -90,6 +96,9 @@ def _load_gold_file(path: Path) -> dict[str, GoldLabel]:
             ),
             expected_status=raw.get("expected_status"),
             recoverable_fields=tuple(str(field) for field in recoverable),
+            version_group=raw.get("version_group"),
+            expected_current_case_id=raw.get("expected_current_case_id"),
+            as_of=raw.get("as_of"),
         )
     return labels
 
@@ -444,6 +453,117 @@ def _score_evidence_task(
     return scores
 
 
+def _candidate_from_record(record: OutputRecord) -> VersionCandidate | None:
+    """Build a version candidate from extracted evidence only.
+
+    Missing or unparseable version/effective_date is an extraction failure,
+    not a currency decision by the model.
+    """
+    parsed = _parse_evidence_output(record)
+    if parsed is None:
+        return None
+    version = parsed.version
+    effective = parsed.effective_date
+    if (
+        version.status != "present"
+        or effective.status != "present"
+        or not isinstance(version.value, str)
+        or not isinstance(effective.value, str)
+    ):
+        return None
+    try:
+        effective_date = date.fromisoformat(effective.value)
+    except ValueError:
+        return None
+    return VersionCandidate(
+        case_id=record.case_id,
+        version=version.value,
+        effective_date=effective_date,
+    )
+
+
+def score_version_selection(
+    records: list[OutputRecord],
+    gold_by_id: dict[str, GoldLabel],
+) -> list[ScoreRecord]:
+    """Score which document is current using select_current_version.
+
+    The model is not asked which document is current. A miss is either
+    bad extraction (no usable version/date candidate) or a wrong
+    deterministic rule result.
+    """
+    grouped: dict[tuple[str, str, str, str, str], list[OutputRecord]] = defaultdict(list)
+    for record in records:
+        gold = gold_by_id.get(record.case_id)
+        if gold is None or gold.version_group is None:
+            continue
+        grouped[
+            (
+                record.run_id,
+                record.task,
+                record.model_name,
+                record.prompt_version,
+                gold.version_group,
+            )
+        ].append(record)
+
+    scores: list[ScoreRecord] = []
+    for (_run_id, _task, _model, _prompt, group_name), group_records in grouped.items():
+        if len(group_records) < 2:
+            continue
+        golds = [gold_by_id[record.case_id] for record in group_records]
+        expected = next(
+            (gold.expected_current_case_id for gold in golds if gold.expected_current_case_id),
+            None,
+        )
+        as_of_raw = next((gold.as_of for gold in golds if gold.as_of), None)
+        if expected is None or as_of_raw is None:
+            continue
+
+        candidates: list[VersionCandidate] = []
+        missing: list[str] = []
+        for record in group_records:
+            candidate = _candidate_from_record(record)
+            if candidate is None:
+                missing.append(record.case_id)
+            else:
+                candidates.append(candidate)
+
+        selected = select_current_version(candidates, date.fromisoformat(as_of_raw))
+        correct = selected is not None and selected.case_id == expected
+        selected_id = selected.case_id if selected is not None else "none"
+        if correct:
+            detail = f"expected={expected}; selected={selected_id}"
+        elif missing:
+            detail = (
+                f"expected={expected}; selected={selected_id}; "
+                "bad extraction: missing version/effective_date for "
+                + ", ".join(missing)
+            )
+        else:
+            detail = (
+                f"expected={expected}; selected={selected_id}; "
+                "deterministic rule did not select expected current case"
+            )
+
+        template = group_records[0]
+        scores.append(
+            ScoreRecord(
+                run_id=template.run_id,
+                task=template.task,
+                case_id=f"version:{group_name}",
+                model_name=template.model_name,
+                prompt_version=template.prompt_version,
+                scorer_version=SCORER_VERSION,
+                metric="version_selection_accuracy",
+                numerator=int(correct),
+                denominator=1,
+                detail=detail,
+            )
+        )
+    return scores
+
+
 def score_output(
     record: OutputRecord,
     gold: GoldLabel,
@@ -468,6 +588,7 @@ def score_records(
     for record in records:
         gold = labels[record.case_id]
         scores.extend(score_output(record, gold, source=sources.get(record.case_id)))
+    scores.extend(score_version_selection(records, labels))
     return scores
 
 
