@@ -1,4 +1,4 @@
-"""Deterministic Day 4 triage scoring.
+"""Deterministic scoring for Day 4 triage and remaining Day 5 metrics.
 
 Uses the existing ``ScoreRecord`` contract. Does not call a model.
 """
@@ -7,15 +7,21 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from promptlab.config import PROJECT_ROOT
-from promptlab.records import OutputRecord, ScoreRecord, append_record, load_records
+from pydantic import ValidationError
 
-SCORER_VERSION = "day4.v1"
+from promptlab.config import PII_PATTERNS, PROJECT_ROOT
+from promptlab.records import OutputRecord, ScoreRecord, append_record, load_records
+from promptlab.schemas import PolicyExtraction, SummarizationOutput
+
+SCORER_VERSION = "day5.v1"
 GOLD_PATH = PROJECT_ROOT / "cases" / "gold" / "triage.jsonl"
+GOLD_DIR = PROJECT_ROOT / "cases" / "gold"
+CASES_DIR = PROJECT_ROOT / "cases"
 RUN_PATH = PROJECT_ROOT / "docs" / "day4-run.jsonl"
 SCORE_PATH = PROJECT_ROOT / "docs" / "day4-scores.jsonl"
 
@@ -31,24 +37,59 @@ BOUNDARY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bfinal (?:decision|outcome|resolution)\b", re.IGNORECASE),
 )
 
+_NUMBERED_HEADING = re.compile(r"^(\d+\.\s+)(.+)$")
+_MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+(.+)$")
+_TASKS = ("triage", "summarization", "extraction")
+
 
 @dataclass(frozen=True)
 class GoldLabel:
     case_id: str
-    expected_queue: str
-    expected_escalation: bool
+    expected_queue: str | None = None
+    expected_escalation: bool | None = None
+    expected_status: str | None = None
+    recoverable_fields: tuple[str, ...] = ()
 
 
-def load_gold_labels(path: Path = GOLD_PATH) -> dict[str, GoldLabel]:
+def load_gold_labels(path: Path | None = None) -> dict[str, GoldLabel]:
+    """Load gold labels. A specific path loads one file; otherwise all task files."""
+    if path is not None:
+        return _load_gold_file(path)
+
+    labels: dict[str, GoldLabel] = {}
+    for task in _TASKS:
+        labels.update(_load_gold_file(GOLD_DIR / f"{task}.jsonl"))
+    return labels
+
+
+def load_sources() -> dict[str, str]:
+    """Load case source documents so citation checks can verify section headings."""
+    sources: dict[str, str] = {}
+    for task in _TASKS:
+        path = CASES_DIR / f"{task}.jsonl"
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            sources[raw["id"]] = raw["source"]
+    return sources
+
+
+def _load_gold_file(path: Path) -> dict[str, GoldLabel]:
     labels: dict[str, GoldLabel] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         raw = json.loads(line)
+        recoverable = raw.get("recoverable_fields") or []
         labels[raw["id"]] = GoldLabel(
             case_id=raw["id"],
-            expected_queue=raw["expected_queue"],
-            expected_escalation=bool(raw["expected_escalation"]),
+            expected_queue=raw.get("expected_queue"),
+            expected_escalation=(
+                None if "expected_escalation" not in raw else bool(raw["expected_escalation"])
+            ),
+            expected_status=raw.get("expected_status"),
+            recoverable_fields=tuple(str(field) for field in recoverable),
         )
     return labels
 
@@ -70,6 +111,53 @@ def _human_boundary_pass(output: dict[str, Any]) -> tuple[bool, str | None]:
     if hits:
         return False, "draft_reply outcome language: " + ", ".join(hits)
     return True, None
+
+
+def section_headings(source: str) -> set[str]:
+    """Return headings a citation may legally name."""
+    headings: set[str] = set()
+    for raw in source.splitlines():
+        line = raw.strip()
+        markdown = _MARKDOWN_HEADING.match(line)
+        if markdown:
+            headings.add(markdown.group(1).strip())
+            continue
+        numbered = _NUMBERED_HEADING.match(line)
+        if numbered and len(line) <= 80:
+            headings.add(line)
+            headings.add(numbered.group(2).strip())
+    return headings
+
+
+def citation_exists(citation: str | None, source: str) -> bool:
+    """True only when the citation names a heading that appears in the source."""
+    if citation is None or not citation.strip():
+        return False
+    return citation.strip() in section_headings(source)
+
+
+def _iter_strings(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_strings(nested)
+
+
+def pii_hits(output: dict[str, Any]) -> list[str]:
+    """Return synthetic PII strings found in free-text model output."""
+    hits: list[str] = []
+    seen: set[str] = set()
+    for text in _iter_strings(output):
+        for pattern in PII_PATTERNS:
+            for match in pattern.findall(text):
+                if match not in seen:
+                    seen.add(match)
+                    hits.append(match)
+    return hits
 
 
 def _score(
@@ -96,57 +184,169 @@ def _score(
     )
 
 
-def score_output(record: OutputRecord, gold: GoldLabel) -> list[ScoreRecord]:
-    """Score one triage output against the gold queue and escalation labels."""
+def _evidence_fields(output: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    fields: dict[str, dict[str, Any]] = {}
+    for name, value in output.items():
+        if isinstance(value, dict) and "status" in value:
+            fields[name] = value
+    return fields
+
+
+def _parse_evidence_output(
+    record: OutputRecord,
+) -> SummarizationOutput | PolicyExtraction | None:
+    if record.output is None:
+        return None
+    schema: type[SummarizationOutput] | type[PolicyExtraction]
+    if record.task == "summarization":
+        schema = SummarizationOutput
+    elif record.task == "extraction":
+        schema = PolicyExtraction
+    else:
+        return None
+    try:
+        return schema.model_validate(record.output)
+    except ValidationError:
+        return None
+
+
+def _required_evidence_scores(
+    record: OutputRecord,
+    gold: GoldLabel,
+    fields: dict[str, dict[str, Any]],
+) -> list[ScoreRecord]:
+    recoverable = list(gold.recoverable_fields)
+    present_names = [
+        name for name, field in fields.items() if field.get("status") == "present"
+    ]
+    found = [name for name in recoverable if name in present_names]
+    missed = [name for name in recoverable if name not in present_names]
+    invented = [name for name in present_names if name not in set(recoverable)]
+    recoverable_n = len(recoverable)
+    present_n = len(present_names)
+
+    return [
+        _score(
+            record=record,
+            metric="required_evidence",
+            numerator=len(found),
+            denominator=recoverable_n,
+            detail=f"required evidence found: {len(found)}/{recoverable_n}",
+        ),
+        _score(
+            record=record,
+            metric="missed_evidence",
+            numerator=len(missed),
+            denominator=recoverable_n,
+            lower_is_better=True,
+            detail=None if not missed else "missed: " + ", ".join(missed),
+        ),
+        _score(
+            record=record,
+            metric="invented_unsupported",
+            numerator=len(invented),
+            denominator=present_n,
+            lower_is_better=True,
+            detail=None if not invented else "invented/unsupported: " + ", ".join(invented),
+        ),
+    ]
+
+
+def _citation_score(
+    record: OutputRecord,
+    fields: dict[str, dict[str, Any]],
+    source: str,
+) -> ScoreRecord:
+    present = [
+        (name, field)
+        for name, field in fields.items()
+        if field.get("status") == "present"
+    ]
+    correct = 0
+    failed: list[str] = []
+    for name, field in present:
+        citation = field.get("citation")
+        citation_text = citation if isinstance(citation, str) else None
+        if citation_exists(citation_text, source):
+            correct += 1
+        else:
+            failed.append(name)
+    return _score(
+        record=record,
+        metric="citation_correct",
+        numerator=correct,
+        denominator=len(present),
+        detail=(
+            None
+            if not failed
+            else "citation missing or not a source heading: " + ", ".join(failed)
+        ),
+    )
+
+
+def _pii_score(record: OutputRecord, output: dict[str, Any] | None) -> ScoreRecord:
+    hits = pii_hits(output or {})
+    return _score(
+        record=record,
+        metric="pii_leakage",
+        numerator=int(bool(hits)),
+        denominator=1,
+        lower_is_better=True,
+        detail=None if not hits else "pii: " + ", ".join(hits),
+    )
+
+
+def _missing_triage_scores(record: OutputRecord, gold: GoldLabel) -> list[ScoreRecord]:
+    missed = 1 if gold.expected_escalation else 0
+    return [
+        _score(record=record, metric="queue", numerator=0, denominator=1, detail="missing output"),
+        _score(
+            record=record,
+            metric="escalation",
+            numerator=0,
+            denominator=1,
+            detail="missing output",
+        ),
+        _score(
+            record=record,
+            metric="missed_escalation",
+            numerator=missed,
+            denominator=1,
+            lower_is_better=True,
+            detail="missing output",
+        ),
+        _score(
+            record=record,
+            metric="unnecessary_escalation",
+            numerator=0,
+            denominator=1,
+            lower_is_better=True,
+            detail="missing output",
+        ),
+        _score(
+            record=record,
+            metric="human_boundary",
+            numerator=0,
+            denominator=1,
+            detail="missing output",
+        ),
+        _pii_score(record, None),
+    ]
+
+
+def _score_triage(record: OutputRecord, gold: GoldLabel) -> list[ScoreRecord]:
     output = record.output
     if not record.succeeded or output is None:
-        missed = 1 if gold.expected_escalation else 0
-        return [
-            _score(
-                record=record,
-                metric="queue",
-                numerator=0,
-                denominator=1,
-                detail="missing output",
-            ),
-            _score(
-                record=record,
-                metric="escalation",
-                numerator=0,
-                denominator=1,
-                detail="missing output",
-            ),
-            _score(
-                record=record,
-                metric="missed_escalation",
-                numerator=missed,
-                denominator=1,
-                lower_is_better=True,
-                detail="missing output",
-            ),
-            _score(
-                record=record,
-                metric="unnecessary_escalation",
-                numerator=0,
-                denominator=1,
-                lower_is_better=True,
-                detail="missing output",
-            ),
-            _score(
-                record=record,
-                metric="human_boundary",
-                numerator=0,
-                denominator=1,
-                detail="missing output",
-            ),
-        ]
+        return _missing_triage_scores(record, gold)
 
     predicted_queue = output.get("queue")
     predicted_escalation = bool(output.get("escalation_required"))
-    queue_correct = int(predicted_queue == gold.expected_queue)
-    escalation_correct = int(predicted_escalation == gold.expected_escalation)
-    missed = int(gold.expected_escalation and not predicted_escalation)
-    unnecessary = int(predicted_escalation and not gold.expected_escalation)
+    expected_queue = gold.expected_queue
+    expected_escalation = bool(gold.expected_escalation)
+    queue_correct = int(predicted_queue == expected_queue)
+    escalation_correct = int(predicted_escalation == expected_escalation)
+    missed = int(expected_escalation and not predicted_escalation)
+    unnecessary = int(predicted_escalation and not expected_escalation)
     boundary_ok, boundary_detail = _human_boundary_pass(output)
 
     return [
@@ -155,16 +355,14 @@ def score_output(record: OutputRecord, gold: GoldLabel) -> list[ScoreRecord]:
             metric="queue",
             numerator=queue_correct,
             denominator=1,
-            detail=f"predicted={predicted_queue} expected={gold.expected_queue}",
+            detail=f"predicted={predicted_queue} expected={expected_queue}",
         ),
         _score(
             record=record,
             metric="escalation",
             numerator=escalation_correct,
             denominator=1,
-            detail=(
-                f"predicted={predicted_escalation} expected={gold.expected_escalation}"
-            ),
+            detail=f"predicted={predicted_escalation} expected={expected_escalation}",
         ),
         _score(
             record=record,
@@ -189,18 +387,87 @@ def score_output(record: OutputRecord, gold: GoldLabel) -> list[ScoreRecord]:
             denominator=1,
             detail=boundary_detail,
         ),
+        _pii_score(record, output),
     ]
+
+
+def _score_evidence_task(
+    record: OutputRecord,
+    gold: GoldLabel,
+    source: str,
+) -> list[ScoreRecord]:
+    parsed = _parse_evidence_output(record)
+    if not record.succeeded or record.output is None or parsed is None:
+        recoverable_n = len(gold.recoverable_fields)
+        return [
+            _score(
+                record=record,
+                metric="required_evidence",
+                numerator=0,
+                denominator=recoverable_n,
+                detail="missing output",
+            ),
+            _score(
+                record=record,
+                metric="missed_evidence",
+                numerator=recoverable_n,
+                denominator=recoverable_n,
+                lower_is_better=True,
+                detail="missing output",
+            ),
+            _score(
+                record=record,
+                metric="invented_unsupported",
+                numerator=0,
+                denominator=0,
+                lower_is_better=True,
+                detail="missing output",
+            ),
+            _score(
+                record=record,
+                metric="citation_correct",
+                numerator=0,
+                denominator=0,
+                detail="missing output",
+            ),
+            _pii_score(record, record.output),
+        ]
+
+    fields = {
+        name: field.model_dump(mode="json") for name, field in parsed.evidence_fields().items()
+    }
+    if not fields:
+        fields = _evidence_fields(record.output)
+    scores = _required_evidence_scores(record, gold, fields)
+    scores.append(_citation_score(record, fields, source))
+    scores.append(_pii_score(record, record.output))
+    return scores
+
+
+def score_output(
+    record: OutputRecord,
+    gold: GoldLabel,
+    source: str | None = None,
+) -> list[ScoreRecord]:
+    """Score one output against gold using the Day 4 ScoreRecord contract."""
+    if record.task == "triage":
+        return _score_triage(record, gold)
+
+    resolved_source = source if source is not None else load_sources().get(record.case_id, "")
+    return _score_evidence_task(record, gold, resolved_source)
 
 
 def score_records(
     records: list[OutputRecord],
     gold_by_id: dict[str, GoldLabel] | None = None,
+    sources_by_id: dict[str, str] | None = None,
 ) -> list[ScoreRecord]:
     labels = gold_by_id if gold_by_id is not None else load_gold_labels()
+    sources = sources_by_id if sources_by_id is not None else load_sources()
     scores: list[ScoreRecord] = []
     for record in records:
         gold = labels[record.case_id]
-        scores.extend(score_output(record, gold))
+        scores.extend(score_output(record, gold, source=sources.get(record.case_id)))
     return scores
 
 
