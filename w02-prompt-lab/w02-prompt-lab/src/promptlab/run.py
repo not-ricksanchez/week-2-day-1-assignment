@@ -10,6 +10,7 @@ from promptlab.adapters.base import CompletionRequest, CompletionResult
 from promptlab.adapters.ollama import OllamaAdapter
 from promptlab.config import PROJECT_ROOT, Settings
 from promptlab.corpus import load_cases, validate_corpus
+from promptlab.errors import UnknownModelError
 from promptlab.prompts import PromptTemplate, load, render_user
 from promptlab.records import OutputRecord, append_record
 from promptlab.schemas import (
@@ -41,7 +42,7 @@ class RecordingAdapter:
 
     def __init__(self, inner: OllamaAdapter) -> None:
         self._inner = inner
-        self.provider = inner.provider
+        self.provider: str = inner.provider
         self.model_id = inner.model_id
         self.results: list[CompletionResult] = []
 
@@ -127,16 +128,19 @@ def main() -> None:
 
     settings = Settings.from_env()
     if args.model:
-        if args.model not in settings.models:
+        try:
+            selected_models = [settings.resolve_model(args.model)]
+        except UnknownModelError:
             known = ", ".join(settings.models)
-            raise SystemExit(f"unknown model {args.model!r}; configured names: {known}")
-        selected_models = [args.model]
+            raise SystemExit(
+                f"unknown model {args.model!r}; configured names: {known}"
+            ) from None
     else:
-        selected_models = list(settings.models)
+        selected_models = [settings.resolve_model(name) for name in settings.models]
 
     adapters = {
-        name: RecordingAdapter(OllamaAdapter(model_id=settings.models[name].model_id))
-        for name in selected_models
+        model.logical_name: RecordingAdapter(OllamaAdapter(model_id=model.model_id))
+        for model in selected_models
     }
 
     if RUN_PATH.exists():
@@ -152,8 +156,8 @@ def main() -> None:
         prompt_id, prompt_version = TASK_PROMPTS[task]
         template = load(prompt_id, prompt_version)
         schema = _output_schema(task, prompt_version)
-        for model_name in selected_models:
-            adapter = adapters[model_name]
+        for model in selected_models:
+            adapter = adapters[model.logical_name]
             for case, _gold in pairs:
                 adapter.reset()
                 request = _build_request(
@@ -185,8 +189,8 @@ def main() -> None:
                     run_id=run_id,
                     task=task,
                     case_id=case.id,
-                    model_name=model_name,
-                    model_id=adapter.model_id,
+                    model_name=model.logical_name,
+                    model_id=model.model_id,
                     prompt_version=template.version,
                     succeeded=parsed is not None,
                     repairs=max(0, len(adapter.results) - 1),
@@ -196,7 +200,7 @@ def main() -> None:
                 append_record(RUN_PATH, output_record)
                 outputs.append(output_record)
                 print(
-                    f"{task:13} {model_name:8} {case.id:5} "
+                    f"{task:13} {model.logical_name:8} {case.id:5} "
                     f"{'ok' if output_record.succeeded else 'failed'}"
                 )
 

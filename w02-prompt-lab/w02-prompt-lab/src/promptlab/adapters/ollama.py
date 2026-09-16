@@ -11,7 +11,7 @@ from uuid import uuid4
 import httpx
 
 from promptlab.adapters.base import CompletionRequest, CompletionResult
-from promptlab.config import Settings
+from promptlab.config import PROVIDER, Settings
 from promptlab.errors import (
     PermanentProviderError,
     ProviderError,
@@ -27,7 +27,7 @@ TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class OllamaAdapter:
-    provider = "ollama"
+    provider = PROVIDER
 
     def __init__(self, model_id: str) -> None:
         settings = Settings.from_env()
@@ -170,7 +170,7 @@ class OllamaAdapter:
             record_id=str(uuid4()),
             run_id=run_id,
             timestamp=datetime.now(UTC),
-            provider="ollama",
+            provider=PROVIDER,
             model_id=self.model_id,
             task=request.task,
             case_id=request.case_id,
