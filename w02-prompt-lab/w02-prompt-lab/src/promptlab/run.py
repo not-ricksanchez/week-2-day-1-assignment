@@ -184,6 +184,7 @@ def main() -> None:
                     case_id=case.id,
                     model_name=model.logical_name,
                     model_id=model.model_id,
+                    prompt_id=template.prompt_id,
                     prompt_version=template.version,
                     succeeded=parsed is not None,
                     repairs=max(0, len(adapter.results) - 1),

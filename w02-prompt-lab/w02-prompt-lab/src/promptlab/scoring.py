@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from promptlab.config import PII_PATTERNS, PROJECT_ROOT
+from promptlab.prompts import TASK_PROMPTS
 from promptlab.records import OutputRecord, ScoreRecord, append_record, load_records
 from promptlab.rules import VersionCandidate, select_current_version
 from promptlab.schemas import PolicyExtraction, SummarizationOutput
@@ -169,6 +170,12 @@ def pii_hits(output: dict[str, Any]) -> list[str]:
     return hits
 
 
+def _prompt_id(record: OutputRecord) -> str:
+    if record.prompt_id:
+        return record.prompt_id
+    return TASK_PROMPTS[record.task].prompt_id
+
+
 def _score(
     *,
     record: OutputRecord,
@@ -183,6 +190,8 @@ def _score(
         task=record.task,
         case_id=record.case_id,
         model_name=record.model_name,
+        model_id=record.model_id,
+        prompt_id=_prompt_id(record),
         prompt_version=record.prompt_version,
         scorer_version=SCORER_VERSION,
         metric=metric,
@@ -553,6 +562,8 @@ def score_version_selection(
                 task=template.task,
                 case_id=f"version:{group_name}",
                 model_name=template.model_name,
+                model_id=template.model_id,
+                prompt_id=_prompt_id(template),
                 prompt_version=template.prompt_version,
                 scorer_version=SCORER_VERSION,
                 metric="version_selection_accuracy",
@@ -584,11 +595,19 @@ def score_records(
 ) -> list[ScoreRecord]:
     labels = gold_by_id if gold_by_id is not None else load_gold_labels()
     sources = sources_by_id if sources_by_id is not None else load_sources()
-    scores: list[ScoreRecord] = []
+    filled: list[OutputRecord] = []
     for record in records:
+        if record.prompt_id:
+            filled.append(record)
+        else:
+            filled.append(
+                record.model_copy(update={"prompt_id": TASK_PROMPTS[record.task].prompt_id})
+            )
+    scores: list[ScoreRecord] = []
+    for record in filled:
         gold = labels[record.case_id]
         scores.extend(score_output(record, gold, source=sources.get(record.case_id)))
-    scores.extend(score_version_selection(records, labels))
+    scores.extend(score_version_selection(filled, labels))
     return scores
 
 
