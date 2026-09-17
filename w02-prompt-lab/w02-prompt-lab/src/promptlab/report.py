@@ -1,30 +1,57 @@
 """Reporting for the Week 2 model-comparison lab.
 
-The reporting layer consumes the existing UsageRecord, OutputRecord, and
-ScoreRecord objects.  It does not rescore model output and it does not call an
-LLM.
+The reporting layer consumes OutputRecord, ScoreRecord, and CallRecord
+objects. It does not rescore model output and it does not call an LLM.
 """
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from datetime import timedelta
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, cast
 
-from promptlab.records import OutputRecord, ScoreRecord, UsageRecord
+from promptlab.config import PROJECT_ROOT
+from promptlab.prompts import TASK_PROMPTS, prompt_for
+from promptlab.records import OutputRecord, ScoreRecord, UsageRecord, load_records
+from promptlab.schemas import TaskName
+from promptlab.usage import CallRecord
 
+_ConfigKey = tuple[str, str, str, str]  # task, model_name, prompt_id, prompt_version
+_JoinKey = tuple[str, str, str, str, str, str]
+_CASE_GAP = timedelta(minutes=10)
+_TASK_ORDER = ("summarization", "extraction", "triage")
+_MODEL_ORDER = ("mistral", "qwen")
 
-_ConfigKey = tuple[str, str, str]  # task, model_name, prompt_version
-
-
-def _key(record: Any) -> _ConfigKey:
-    return (
-        str(record.task),
-        str(record.model_name),
-        str(record.prompt_version),
-    )
+_QUALITY_METRICS: dict[str, tuple[tuple[str, str], ...]] = {
+    "triage": (
+        ("queue", "routing"),
+        ("escalation", "escalation"),
+        ("missed_escalation", "missed escalations"),
+        ("unnecessary_escalation", "unnecessary escalations"),
+        ("human_boundary", "human-boundary"),
+        ("pii_leakage", "PII leakage"),
+    ),
+    "summarization": (
+        ("required_evidence", "required evidence"),
+        ("missed_evidence", "missed evidence"),
+        ("invented_unsupported", "invented/unsupported"),
+        ("citation_correct", "citation correct"),
+        ("pii_leakage", "PII leakage"),
+        ("version_selection_accuracy", "version selection"),
+    ),
+    "extraction": (
+        ("required_evidence", "required evidence"),
+        ("missed_evidence", "missed evidence"),
+        ("invented_unsupported", "invented/unsupported"),
+        ("citation_correct", "citation correct"),
+        ("pii_leakage", "PII leakage"),
+        ("version_selection_accuracy", "version selection"),
+    ),
+}
 
 
 def _for_run(records: Sequence[Any], run_id: str) -> list[Any]:
@@ -37,68 +64,130 @@ def _fmt_number(value: float) -> str:
     return f"{value:.1f}"
 
 
+def _join_key(record: Any) -> _JoinKey:
+    return (
+        str(record.run_id),
+        str(record.case_id),
+        str(record.task),
+        str(record.model_id),
+        str(getattr(record, "prompt_id", "") or ""),
+        str(record.prompt_version),
+    )
+
+
+def _config_key(record: Any) -> _ConfigKey:
+    prompt_id = str(getattr(record, "prompt_id", "") or "")
+    if not prompt_id and str(record.task) in TASK_PROMPTS:
+        prompt_id = TASK_PROMPTS[cast(TaskName, record.task)].prompt_id
+    model_name = str(getattr(record, "model_name", "") or "")
+    return (str(record.task), model_name, prompt_id, str(record.prompt_version))
+
+
+def latest_calls_for_outputs(
+    calls: Sequence[CallRecord],
+    outputs: Sequence[OutputRecord],
+) -> list[CallRecord]:
+    """Keep the latest call cluster per output case.
+
+    ``runs/{run_id}.jsonl`` is append-only, so a repeated ``--run-id`` leaves
+    earlier interrupted or repeated attempts in the file. Token and latency
+    totals must not count those earlier evaluations.
+    """
+
+    wanted = {_join_key(record) for record in outputs}
+    grouped: dict[_JoinKey, list[CallRecord]] = defaultdict(list)
+    for call in calls:
+        key = _join_key(call)
+        if key in wanted:
+            grouped[key].append(call)
+
+    selected: list[CallRecord] = []
+    for rows in grouped.values():
+        ordered = sorted(rows, key=lambda row: row.timestamp)
+        clusters: list[list[CallRecord]] = [[ordered[0]]]
+        for call in ordered[1:]:
+            if call.timestamp - clusters[-1][-1].timestamp <= _CASE_GAP:
+                clusters[-1].append(call)
+            else:
+                clusters.append([call])
+        selected.extend(clusters[-1])
+    return selected
+
+
+def _prompt_label(task: str, model_name: str, prompt_id: str, prompt_version: str) -> str:
+    spec = prompt_for(cast(TaskName, task), model_name)
+    if spec.prompt_id == prompt_id and spec.version == prompt_version:
+        return spec.label(model_name)
+    default = TASK_PROMPTS[cast(TaskName, task)]
+    if default.prompt_id == prompt_id and default.version == prompt_version:
+        return default.label(model_name)
+    return f"{prompt_id}.{prompt_version}"
+
+
+def _model_display(model_name: str) -> str:
+    return model_name[:1].upper() + model_name[1:]
+
+
 def _aggregate_scores(
     records: Sequence[ScoreRecord],
-) -> dict[str, tuple[int, int, bool | None]]:
-    """Aggregate compatible score counts without averaging percentages."""
-
+) -> dict[str, tuple[int, int, bool]]:
     grouped: dict[str, list[ScoreRecord]] = defaultdict(list)
     for record in records:
         grouped[str(record.metric)].append(record)
 
-    result: dict[str, tuple[int, int, bool | None]] = {}
-
-    for metric, rows in sorted(grouped.items()):
+    result: dict[str, tuple[int, int, bool]] = {}
+    for metric, rows in grouped.items():
         numerator = sum(int(row.numerator) for row in rows)
         denominator = sum(int(row.denominator) for row in rows)
-
-        directions = {
-            bool(value)
-            for value in (getattr(row, "lower_is_better", None) for row in rows)
-            if value is not None
-        }
-        lower_is_better: bool | None
-        if len(directions) == 1:
-            lower_is_better = next(iter(directions))
-        else:
-            lower_is_better = None
-
-        result[metric] = (numerator, denominator, lower_is_better)
-
+        result[metric] = (numerator, denominator, bool(rows[0].lower_is_better))
     return result
 
 
-def _metric_text(records: Sequence[ScoreRecord]) -> str:
-    metrics = _aggregate_scores(records)
-    if not metrics:
-        return "—"
+def _quality_cell(
+    task: str,
+    outputs: Sequence[OutputRecord],
+    scores: Sequence[ScoreRecord],
+) -> str:
+    lines: list[str] = []
+    if outputs:
+        succeeded = sum(1 for row in outputs if bool(row.succeeded))
+        lines.append(f"valid: {succeeded}/{len(outputs)}")
 
-    rendered: list[str] = []
-    for metric, (numerator, denominator, lower_is_better) in metrics.items():
+    metrics = _aggregate_scores(scores)
+    for metric, label in _QUALITY_METRICS.get(task, ()):
+        if metric not in metrics:
+            continue
+        numerator, denominator, lower_is_better = metrics[metric]
         suffix = " ↓" if lower_is_better else ""
-        rendered.append(f"{metric}: {numerator}/{denominator}{suffix}")
+        lines.append(f"{label}: {numerator}/{denominator}{suffix}")
+    return "<br>".join(lines) if lines else "—"
 
-    return "<br>".join(rendered)
 
-
-def _usage_summary(
-    records: Sequence[UsageRecord],
-) -> tuple[str, str, str, str, str, str]:
-    """Return token, latency, observation, and retry summaries."""
-
-    if not records:
-        return "—", "—", "—", "—", "0", "0"
-
-    prompt_tokens = sum(int(getattr(row, "prompt_tokens", 0) or 0) for row in records)
-    completion_tokens = sum(
-        int(getattr(row, "completion_tokens", 0) or 0) for row in records
+def _token_pair(row: Any) -> tuple[int, int]:
+    if hasattr(row, "input_tokens"):
+        return int(row.input_tokens), int(row.output_tokens)
+    return int(getattr(row, "prompt_tokens", 0) or 0), int(
+        getattr(row, "completion_tokens", 0) or 0
     )
 
-    latencies = [
-        float(row.latency_ms)
-        for row in records
-        if getattr(row, "latency_ms", None) is not None
-    ]
+
+def _usage_cell(
+    records: Sequence[Any],
+    n_cases: int,
+) -> tuple[str, str, str, str]:
+    if not records or n_cases == 0:
+        return "—", "—", "—", "—"
+
+    input_tokens = 0
+    output_tokens = 0
+    latencies: list[float] = []
+    for row in records:
+        prompt_tokens, completion_tokens = _token_pair(row)
+        input_tokens += prompt_tokens
+        output_tokens += completion_tokens
+        latency = getattr(row, "latency_ms", None)
+        if latency is not None:
+            latencies.append(float(latency))
 
     if latencies:
         median_latency = f"{_fmt_number(float(median(latencies)))} ms"
@@ -107,66 +196,56 @@ def _usage_summary(
         median_latency = "—"
         max_latency = "—"
 
-    # A semantic repair is a separate model request and should not also be
-    # reported as a transport retry merely because it has an attempt number.
-    repair_attempts = sum(
-        1
-        for row in records
-        if str(getattr(row, "kind", "")).lower() == "repair"
-    )
-
-    retry_attempts = sum(
-        1
-        for row in records
-        if int(getattr(row, "attempt", 1) or 1) > 1
-        and str(getattr(row, "kind", "")).lower() != "repair"
-    )
-
     return (
-        str(prompt_tokens),
-        str(completion_tokens),
+        _fmt_number(input_tokens / n_cases),
+        _fmt_number(output_tokens / n_cases),
         median_latency,
         max_latency,
-        str(len(latencies)),
-        str(retry_attempts),
     )
 
 
-def _output_summary(
-    records: Sequence[OutputRecord],
-) -> tuple[str, str, str]:
-    if not records:
-        return "0/0", "0/0", "0"
-
-    total = len(records)
-    succeeded = sum(1 for row in records if bool(row.succeeded))
-    repairs_needed = sum(
-        1 for row in records if int(getattr(row, "repairs", 0) or 0) > 0
-    )
-    failures = total - succeeded
-
-    return (
-        f"{succeeded}/{total}",
-        f"{repairs_needed}/{total}",
-        str(failures),
-    )
+def _repair_cell(outputs: Sequence[OutputRecord]) -> str:
+    if not outputs:
+        return "0/0"
+    needed = sum(1 for row in outputs if int(getattr(row, "repairs", 0) or 0) > 0)
+    return f"{needed}/{len(outputs)}"
 
 
-def _all_config_keys(
-    usage: Sequence[UsageRecord],
-    outputs: Sequence[OutputRecord],
-    scores: Sequence[ScoreRecord],
-) -> list[_ConfigKey]:
-    keys = {_key(row) for row in usage}
-    keys.update(_key(row) for row in outputs)
-    keys.update(_key(row) for row in scores)
-    return sorted(keys)
+def _sort_keys(keys: Iterable[_ConfigKey]) -> list[_ConfigKey]:
+    def rank(key: _ConfigKey) -> tuple[int, int, str, str]:
+        task, model_name, prompt_id, prompt_version = key
+        task_rank = _TASK_ORDER.index(task) if task in _TASK_ORDER else 99
+        model_rank = _MODEL_ORDER.index(model_name) if model_name in _MODEL_ORDER else 99
+        return (task_rank, model_rank, prompt_id, prompt_version)
+
+    return sorted(keys, key=rank)
+
+
+def _prompt_notes(keys: Sequence[_ConfigKey]) -> list[str]:
+    notes: list[str] = []
+    for task, model_name, prompt_id, prompt_version in keys:
+        label = _prompt_label(task, model_name, prompt_id, prompt_version)
+        spec = prompt_for(cast(TaskName, task), model_name)
+        default = TASK_PROMPTS[cast(TaskName, task)]
+        if spec.prompt_id == prompt_id and spec.version == prompt_version:
+            if spec.is_transfer(model_name):
+                notes.append(
+                    f"- `{label}` measures `{model_name}` on the prompt developed "
+                    f"on `{spec.developed_on}`. It is not a claim about "
+                    f"`{model_name}` after adaptation."
+                )
+            elif (spec.prompt_id, spec.version) != (default.prompt_id, default.version):
+                notes.append(
+                    f"- `{label}` is an adapted prompt for `{model_name}`. "
+                    f"`{default.name()}` was preserved and not edited."
+                )
+    return notes
 
 
 def _write_report(
     *,
     run_id: str,
-    usage: Sequence[UsageRecord],
+    usage: Sequence[Any],
     outputs: Sequence[OutputRecord],
     scores: Sequence[ScoreRecord],
     report_path: Path,
@@ -176,97 +255,86 @@ def _write_report(
         "",
         f"Run ID: `{run_id}`",
         "",
-        "Counts are reported with their denominators. "
-        "Latency uses median and maximum rather than mean.",
+        "Counts are reported with their denominators, not percentages. "
+        "Latency uses median and maximum rather than mean. "
+        "Token columns are per case and include schema-repair calls from the "
+        "latest evaluation of each case.",
+        "",
+        "`runs/day5.jsonl` is append-only. If the same run id was executed more "
+        "than once, earlier interrupted or repeated attempts remain in that file. "
+        "This table joins scores to `docs/day5-run.jsonl` and keeps only the "
+        "latest call cluster per case.",
         "",
     ]
 
-    keys = _all_config_keys(usage, outputs, scores)
-    tasks = sorted({task for task, _model, _prompt in keys})
+    keys = _sort_keys({_config_key(row) for row in outputs})
+    tasks = [task for task in _TASK_ORDER if any(key[0] == task for key in keys)]
+    tasks.extend(sorted({task for task, _m, _p, _v in keys if task not in tasks}))
 
     if not tasks:
-        lines.extend(
-            [
-                "No records were supplied for this run.",
-                "",
-            ]
-        )
+        lines.extend(["No records were supplied for this run.", ""])
+
+    usage_by_join: dict[_JoinKey, list[Any]] = defaultdict(list)
+    for row in usage:
+        usage_by_join[_join_key(row)].append(row)
 
     for task in tasks:
         lines.extend(
             [
                 f"## {task.title()}",
                 "",
-                "| Model | Prompt | Valid outputs | Metrics | Input tokens | "
-                "Output tokens | Median latency | Max latency | n | "
-                "Repairs | Retries | Final failures |",
-                "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | "
-                "---: | ---: | ---: |",
+                "| Model | Prompt | Quality | Input tokens/case | Output tokens/case | "
+                "Median latency | Max latency | Repairs |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
 
         task_keys = [key for key in keys if key[0] == task]
-
         for key in task_keys:
-            _task, model_name, prompt_version = key
+            _task, model_name, prompt_id, prompt_version = key
+            o = [row for row in outputs if _config_key(row) == key]
+            s = [row for row in scores if _config_key(row) == key]
+            output_joins = {_join_key(row) for row in o}
+            u = [
+                row
+                for join, rows in usage_by_join.items()
+                if join in output_joins
+                for row in rows
+            ]
 
-            u = [row for row in usage if _key(row) == key]
-            o = [row for row in outputs if _key(row) == key]
-            s = [row for row in scores if _key(row) == key]
-
-            (
-                input_tokens,
-                output_tokens,
-                median_latency,
-                max_latency,
-                n,
-                retries,
-            ) = _usage_summary(u)
-
-            valid_outputs, repairs, failures = _output_summary(o)
-            metric_text = _metric_text(s)
-
+            input_tokens, output_tokens, median_latency, max_latency = _usage_cell(
+                u, len(o)
+            )
+            quality = _quality_cell(task, o, s)
+            prompt = _prompt_label(task, model_name, prompt_id, prompt_version)
             lines.append(
                 "| "
-                f"{model_name} | {prompt_version} | {valid_outputs} | "
-                f"{metric_text} | {input_tokens} | {output_tokens} | "
-                f"{median_latency} | {max_latency} | {n} | {repairs} | "
-                f"{retries} | {failures} |"
+                f"{_model_display(model_name)} | `{prompt}` | {quality} | "
+                f"{input_tokens} | {output_tokens} | {median_latency} | "
+                f"{max_latency} | {_repair_cell(o)} |"
             )
 
         lines.append("")
-
-    lines.extend(
-        [
-            "## Limits",
-            "",
-            "- The Week 2 comparison uses a small fixed case set; report counts rather "
-            "than treating one-case differences as precise production estimates.",
-            "- A row measures the model together with the prompt version shown in that row.",
-            "- A transferred prompt is evidence about that transferred configuration, not "
-            "proof of the model's best achievable performance after adaptation.",
-            "- Local Ollama provider/API charge is `$0.00`; token usage and latency still "
-            "represent real operational work.",
-            "",
-        ]
-    )
+        notes = _prompt_notes(task_keys)
+        if notes:
+            lines.extend([*notes, ""])
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text("\n".join(lines), encoding="utf-8")
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_decision_scaffold(
     *,
     run_id: str,
     models: Sequence[str],
-    usage: Sequence[UsageRecord],
+    usage: Sequence[Any],
     outputs: Sequence[OutputRecord],
     scores: Sequence[ScoreRecord],
     decision_path: Path,
 ) -> None:
     """Write an evidence scaffold, not an invented model recommendation."""
 
-    keys = _all_config_keys(usage, outputs, scores)
+    keys = _sort_keys({_config_key(row) for row in outputs})
 
     lines: list[str] = [
         "# Model Decision Record",
@@ -282,7 +350,7 @@ def _write_decision_scaffold(
     ]
 
     evaluated_models = sorted(
-        {model for _task, model, _prompt in keys} | {str(model) for model in models}
+        {model for _task, model, _prompt, _version in keys} | {str(model) for model in models}
     )
     if evaluated_models:
         for model in evaluated_models:
@@ -293,8 +361,9 @@ def _write_decision_scaffold(
     lines.extend(["", "## Evaluated configurations", ""])
 
     if keys:
-        for task, model, prompt in keys:
-            lines.append(f"- `{task}` — {model} — `{prompt}`")
+        for task, model, prompt_id, prompt_version in keys:
+            label = _prompt_label(task, model, prompt_id, prompt_version)
+            lines.append(f"- `{task}` — {model} — `{label}`")
     else:
         lines.append("- No configurations supplied.")
 
@@ -315,14 +384,14 @@ def _write_decision_scaffold(
     )
 
     decision_path.parent.mkdir(parents=True, exist_ok=True)
-    decision_path.write_text("\n".join(lines), encoding="utf-8")
+    decision_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_reports(
     *,
     run_id: str,
     models: Sequence[str],
-    usage: Sequence[UsageRecord],
+    usage: Sequence[UsageRecord] | Sequence[CallRecord],
     outputs: Sequence[OutputRecord],
     scores: Sequence[ScoreRecord],
     report_path: Path,
@@ -336,12 +405,17 @@ def write_reports(
     run_usage = _for_run(usage, run_id)
     run_outputs = _for_run(outputs, run_id)
     run_scores = _for_run(scores, run_id)
+    if run_usage and isinstance(run_usage[0], CallRecord):
+        run_usage = latest_calls_for_outputs(
+            cast(list[CallRecord], run_usage),
+            cast(list[OutputRecord], run_outputs),
+        )
 
     _write_report(
         run_id=run_id,
         usage=run_usage,
-        outputs=run_outputs,
-        scores=run_scores,
+        outputs=cast(list[OutputRecord], run_outputs),
+        scores=cast(list[ScoreRecord], run_scores),
         report_path=Path(report_path),
     )
 
@@ -349,7 +423,55 @@ def write_reports(
         run_id=run_id,
         models=models,
         usage=run_usage,
-        outputs=run_outputs,
-        scores=run_scores,
+        outputs=cast(list[OutputRecord], run_outputs),
+        scores=cast(list[ScoreRecord], run_scores),
         decision_path=Path(decision_path),
     )
+
+
+def load_call_records(path: Path) -> list[CallRecord]:
+    if not path.exists():
+        return []
+    records: list[CallRecord] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(CallRecord.model_validate(json.loads(line)))
+    return records
+
+
+def write_day5_comparison(
+    *,
+    run_id: str = "day5",
+    outputs_path: Path | None = None,
+    scores_path: Path | None = None,
+    calls_path: Path | None = None,
+    report_path: Path | None = None,
+) -> Path:
+    """Write ``reports/comparison.md`` from the Day 5 evidence files."""
+
+    resolved_report = report_path or (PROJECT_ROOT / "reports" / "comparison.md")
+    outputs = load_records(outputs_path or PROJECT_ROOT / "docs" / "day5-run.jsonl", OutputRecord)
+    scores = load_records(
+        scores_path or PROJECT_ROOT / "docs" / "day5-scores.jsonl", ScoreRecord
+    )
+    calls = load_call_records(calls_path or Path("runs") / f"{run_id}.jsonl")
+    run_outputs = cast(list[OutputRecord], _for_run(outputs, run_id))
+    run_scores = cast(list[ScoreRecord], _for_run(scores, run_id))
+    latest = latest_calls_for_outputs(calls, run_outputs)
+    _write_report(
+        run_id=run_id,
+        usage=latest,
+        outputs=run_outputs,
+        scores=run_scores,
+        report_path=resolved_report,
+    )
+    return resolved_report
+
+
+def main() -> None:
+    path = write_day5_comparison()
+    print(f"wrote {path}")
+
+
+if __name__ == "__main__":
+    main()
