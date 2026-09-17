@@ -5,10 +5,14 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 
+from promptlab.errors import UnknownModelError
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROVIDER: Literal["ollama"] = "ollama"
 
 PII_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
@@ -42,6 +46,13 @@ class Settings:
     max_schema_repairs: int
     per_run_cap_usd: Decimal
     weekly_cap_usd: Decimal
+
+    def resolve_model(self, logical_name: str) -> ModelConfig:
+        """Return the configured model. Call sites must not hardcode model_id."""
+        try:
+            return self.models[logical_name]
+        except KeyError as exc:
+            raise UnknownModelError(logical_name) from exc
 
     @classmethod
     def from_env(cls) -> Settings:

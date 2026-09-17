@@ -71,7 +71,7 @@ class RecordingAdapter:
 
     def __init__(self, inner: OllamaAdapter) -> None:
         self._inner = inner
-        self.provider = inner.provider
+        self.provider: str = inner.provider
         self.model_id = inner.model_id
         self.results: list[CompletionResult] = []
 
