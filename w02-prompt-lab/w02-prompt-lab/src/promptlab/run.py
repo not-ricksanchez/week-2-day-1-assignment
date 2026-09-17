@@ -11,7 +11,7 @@ from promptlab.adapters.ollama import OllamaAdapter
 from promptlab.config import PROJECT_ROOT, Settings
 from promptlab.corpus import load_cases, validate_corpus
 from promptlab.errors import UnknownModelError
-from promptlab.prompts import PromptTemplate, load, render_user
+from promptlab.prompts import PromptTemplate, load, prompt_for, render_user
 from promptlab.records import OutputRecord, append_record
 from promptlab.schemas import (
     OUTPUT_SCHEMAS,
@@ -27,14 +27,7 @@ from promptlab.usage import append_record as append_call_record
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 RUN_PATH = PROJECT_ROOT / "docs" / "day5-run.jsonl"
 SCORE_PATH = PROJECT_ROOT / "docs" / "day5-scores.jsonl"
-MAX_OUTPUT_TOKENS = 512
-
-# Same prompt version on both models. Transfer labeling belongs in the report.
-TASK_PROMPTS: dict[TaskName, tuple[str, str]] = {
-    "summarization": ("summarize", "v1"),
-    "extraction": ("extract", "v2"),
-    "triage": ("triage", "v1"),
-}
+MAX_OUTPUT_TOKENS = 1024
 
 
 class RecordingAdapter:
@@ -153,10 +146,10 @@ def main() -> None:
         pairs = load_cases(task)
         if limit is not None:
             pairs = pairs[:limit]
-        prompt_id, prompt_version = TASK_PROMPTS[task]
-        template = load(prompt_id, prompt_version)
-        schema = _output_schema(task, prompt_version)
         for model in selected_models:
+            spec = prompt_for(task, model.logical_name)
+            template = load(spec.prompt_id, spec.version)
+            schema = _output_schema(task, spec.version)
             adapter = adapters[model.logical_name]
             for case, _gold in pairs:
                 adapter.reset()
@@ -201,6 +194,7 @@ def main() -> None:
                 outputs.append(output_record)
                 print(
                     f"{task:13} {model.logical_name:8} {case.id:5} "
+                    f"{spec.label(model.logical_name):24} "
                     f"{'ok' if output_record.succeeded else 'failed'}"
                 )
 

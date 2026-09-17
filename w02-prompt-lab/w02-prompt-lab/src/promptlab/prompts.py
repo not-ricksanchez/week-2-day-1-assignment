@@ -11,9 +11,12 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
+
+from promptlab.schemas import TaskName
 
 PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
 
@@ -22,6 +25,48 @@ CUSTOMER_MARKER_CLOSE = "</customer_message>"
 
 _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_-]+$")
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+@dataclass(frozen=True)
+class TaskPrompt:
+    """Day 5 prompt assignment: one versioned prompt, plus which model it was developed on."""
+
+    prompt_id: str
+    version: str
+    developed_on: str
+
+    def name(self) -> str:
+        return f"{self.prompt_id}.{self.version}"
+
+    def is_transfer(self, model_logical_name: str) -> bool:
+        return model_logical_name != self.developed_on
+
+    def label(self, model_logical_name: str) -> str:
+        name = self.name()
+        if self.is_transfer(model_logical_name):
+            return f"{name} transfer"
+        return name
+
+
+# Default assignment is a transfer test on the Qwen-developed prompt.
+# Summarization on Mistral uses an adapted version; summarize.v1 is preserved.
+TASK_PROMPTS: dict[TaskName, TaskPrompt] = {
+    "summarization": TaskPrompt("summarize", "v1", "qwen"),
+    "extraction": TaskPrompt("extract", "v2", "qwen"),
+    "triage": TaskPrompt("triage", "v1", "qwen"),
+}
+
+ADAPTED_PROMPTS: dict[tuple[TaskName, str], TaskPrompt] = {
+    ("summarization", "mistral"): TaskPrompt("summarize", "v1-mistral", "mistral"),
+}
+
+
+def prompt_for(task: TaskName, model_logical_name: str) -> TaskPrompt:
+    """Return the prompt this model should run for the task."""
+    adapted = ADAPTED_PROMPTS.get((task, model_logical_name))
+    if adapted is not None:
+        return adapted
+    return TASK_PROMPTS[task]
 
 
 class MissingPromptVariableError(ValueError):
